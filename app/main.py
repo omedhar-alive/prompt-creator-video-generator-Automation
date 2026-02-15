@@ -11,7 +11,7 @@ import time
 from datetime import datetime
 
 from dotenv import load_dotenv
-
+from typing import Any, Dict, Optional
 # Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
@@ -22,11 +22,27 @@ from openai import OpenAI
 # Runway
 from runwayml import RunwayML, TaskFailedError
 
+MAX_WAIT_SEC = 300
+POLL_INTERVAL_SEC = 7
+MAX_RETRIES = 2
 
 # -----------------------------------------------------------------------------
 # App + Env
 # -----------------------------------------------------------------------------
 app = FastAPI(title="AI Video Factory")
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 project_root = Path(__file__).resolve().parents[1]  # repo root (parent of app/)
 env_path = project_root / ".env"
@@ -55,7 +71,9 @@ def get_openai_client() -> OpenAI:
 
 
 def get_runway_client() -> RunwayML:
-    api_key = require_env("RUNWAY_API_KEY")
+    api_key = os.getenv("RUNWAYML_API_SECRET") or os.getenv("RUNWAY_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="Missing RUNWAYML_API_SECRET (or RUNWAY_API_KEY) in .env")
     return RunwayML(api_key=api_key)
 
 
@@ -216,6 +234,51 @@ async def save_uploads_locally(brand_name: str, images: Optional[List[UploadFile
 
     return saved_paths
 
+# -----------------------------------------------------------------------------
+# Internal pipeline functions (no FastAPI decorators)
+# -----------------------------------------------------------------------------
+async def do_ingest(
+    brand_name: str,
+    brand_description: str,
+    product_type: str,
+    target_audience: str,
+    extra_comments: Optional[str],
+    images: Optional[List[UploadFile]],
+) -> IngestResponse:
+    rows = fetch_last_20_for_brand(brand_name)
+    saved_paths = await save_uploads_locally(brand_name, images)
+
+    fields = ["concept_title", "hook_type", "format", "setting", "camera_style", "runway_prompt", "notes"]
+    avoid_list: List[Dict[str, Any]] = []
+    for r in rows:
+        data = {f: (_get_val_ci(r, f) or "") for f in fields}
+        try:
+            item = AvoidItem(**data)
+            avoid_list.append(item.model_dump())
+        except Exception:
+            continue
+
+    return IngestResponse(
+        user_id="default",
+        brand_name=brand_name,
+        brand_description=brand_description,
+        product_type=product_type,
+        target_audience=target_audience,
+        extra_comments=extra_comments,
+        avoid_list=avoid_list,
+        saved_images_local=saved_paths,
+    )
+
+
+async def do_concept_generate(payload: ConceptRequest) -> ConceptResponse:
+    # reuse your existing concept_generate body by calling it directly for now
+    # (next step we can inline it if you want)
+    return await concept_generate(payload)
+
+
+async def do_runway_generate(payload: RunwayGenerateRequest) -> Dict[str, Any]:
+    return await runway_generate(payload)
+
 
 # -----------------------------------------------------------------------------
 # Stage 3: Ingestion endpoint
@@ -344,11 +407,22 @@ async def chatkit_session(req: ChatSessionRequest):
 # -----------------------------------------------------------------------------
 # Stage 5: Runway image-to-video (NO ngrok, uses ephemeral upload)
 # -----------------------------------------------------------------------------
+
+def _is_moderation_timeout(failure: Any) -> bool:
+    try:
+        s = (failure or "")
+        if not isinstance(s, str):
+            s = str(s)
+        return "Timeout during moderation" in s or "moderation" in s.lower() and "timeout" in s.lower()
+    except Exception:
+        return False
+
 @app.post("/runway/generate")
 async def runway_generate(req: RunwayGenerateRequest):
     """
     Uses local image path -> Runway ephemeral upload -> image_to_video task.
-    Polls until SUCCEEDED/FAILED.
+    Retries on transient failures (ex: moderation timeout).
+    Polls until SUCCEEDED/FAILED (with max wait).
     Downloads mp4 into outputs/<brand>/video_YYYYMMDD_HHMMSS.mp4
     """
     runway = get_runway_client()
@@ -361,64 +435,96 @@ async def runway_generate(req: RunwayGenerateRequest):
     output_dir = project_root / "outputs" / safe_brand
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        # 1) Ephemeral upload
-        upload_res = runway.uploads.create_ephemeral(file=img_path)
-        prompt_image_uri = getattr(upload_res, "uri", upload_res)
+    # Tuning knobs
+    max_attempts = 3
+    poll_interval_sec = 5
+    max_wait_sec = 180  # total polling time per attempt (3 minutes)
 
-        # 2) Create task
-        task = runway.image_to_video.create(
-            model=req.model,
-            prompt_image=prompt_image_uri,
-            prompt_text=req.runway_prompt,
-            ratio=req.ratio,
-            duration=req.duration_seconds,
-        )
+    last_error = None
 
-        task_id = task.id
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # 1) Ephemeral upload (do it per-attempt; URI can expire)
+            upload_res = runway.uploads.create_ephemeral(file=img_path)
+            prompt_image_uri = str(getattr(upload_res, "uri", upload_res))
 
-        # 3) Poll
-        while True:
-            task = runway.tasks.retrieve(task_id)
-            status = getattr(task, "status", None)
-            if status in ("SUCCEEDED", "FAILED"):
-                break
-            time.sleep(5)
+            # 2) Create task
+            task = runway.image_to_video.create(
+                model=req.model,
+                prompt_image=prompt_image_uri,
+                prompt_text=req.runway_prompt,
+                ratio=req.ratio,
+                duration=req.duration_seconds,  # Runway expects "duration", your model field is duration_seconds
+            )
+            task_id = task.id
 
-        if task.status == "FAILED":
-            failure = getattr(task, "failure", None)
-            return {"task_id": task_id, "status": "FAILED", "failure": failure}
+            # 3) Poll with timeout
+            start_time = time.time()
+            while True:
+                task = runway.tasks.retrieve(task_id)
+                status = getattr(task, "status", None)
 
-        # 4) Download output (Runway SDK commonly returns list-like output)
-        output = getattr(task, "output", None)
-        if not output:
-            return {"task_id": task_id, "status": "SUCCEEDED", "output": None, "video_file_path": None}
+                if status in ("SUCCEEDED", "FAILED"):
+                    break
 
-        video_url = output[0] if isinstance(output, list) else output
+                if time.time() - start_time > MAX_WAIT_SEC:
+                    return {
+                       "task_id": task_id,
+                        "status": "FAILED",
+                        "failure": "Max wait time exceeded"
+                    }
+                
+                time.sleep(POLL_INTERVAL_SEC)
 
-        # download via requests (simple + reliable)
-        import requests
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        local_path = output_dir / f"video_{ts}.mp4"
+            if task.status == "FAILED":
+                failure = getattr(task, "failure", None) or "Unknown failure"
+                # Treat moderation timeout as retryable
+                msg = str(failure)
+                if "Timeout during moderation" in msg or "moderation" in msg.lower():
+                    raise Exception(f"Retryable failure: {failure}")
+                # Non-retryable: return immediately
+                return {"task_id": task_id, "status": "FAILED", "failure": failure, "attempt": attempt}
 
-        with requests.get(video_url, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            with open(local_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
+            # 4) Download output
+            output = getattr(task, "output", None)
+            if not output:
+                return {"task_id": task_id, "status": "SUCCEEDED", "video_url": None, "video_file_path": None, "attempt": attempt}
 
-        return {
-            "task_id": task_id,
-            "status": "SUCCEEDED",
-            "video_url": video_url,
-            "video_file_path": str(local_path),
-        }
+            video_url = output[0] if isinstance(output, list) else output
 
-    except TaskFailedError as e:
-        return {"status": "FAILED", "task_details": getattr(e, "task_details", None)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            import requests
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            local_path = output_dir / f"video_{ts}.mp4"
+
+            with requests.get(video_url, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                with open(local_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+
+            return {
+                "task_id": task_id,
+                "status": "SUCCEEDED",
+                "video_url": video_url,
+                "video_file_path": str(local_path),
+                "attempt": attempt,
+            }
+
+        except TaskFailedError as e:
+            # SDK-level failure wrapper
+            last_error = getattr(e, "task_details", None) or str(e)
+
+        except Exception as e:
+            # Any other error (including our "retryable failure" exceptions)
+            last_error = str(e)
+
+        # Backoff before next attempt
+        if attempt < max_attempts:
+            time.sleep(5 * attempt)
+
+    # If we got here, all attempts failed
+    return {"status": "FAILED", "detail": last_error, "attempts": max_attempts}
 
 
 @app.get("/outputs/file")
@@ -432,4 +538,65 @@ async def get_output_file(path: str):
     if not p.exists():
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(str(p), filename=p.name)
-    
+
+
+
+@app.post("/pipeline/generate")
+async def pipeline_generate(
+    request: Request,
+    brand_name: str = Form(...),
+    brand_description: str = Form(...),
+    product_type: str = Form(...),
+    target_audience: str = Form(...),
+    extra_comments: Optional[str] = Form(None),
+    images: Optional[List[UploadFile]] = File(None),
+) -> Dict[str, Any]:
+    """
+    One-shot pipeline:
+    1) ingest (save images + build avoid_list from Sheets)
+    2) concept (OpenAI)
+    3) runway (optional, if image exists)
+    """
+    # 1) Ingest (call function directly)
+    ingest_result: IngestResponse = await ingest(
+        request=request,
+        brand_name=brand_name,
+        brand_description=brand_description,
+        product_type=product_type,
+        target_audience=target_audience,
+        extra_comments=extra_comments,
+        images=images,
+    )
+
+    # 2) Concept
+    concept_result: ConceptResponse = await concept_generate(
+        ConceptRequest(**ingest_result.model_dump())
+    )
+
+    # 3) Runway (optional)
+    runway_result: Optional[Dict[str, Any]] = None
+    if ingest_result.saved_images_local:
+        try:
+            runway_payload = RunwayGenerateRequest(
+                brand_name=ingest_result.brand_name,
+                runway_prompt=concept_result.runway_prompt,
+                image_path_local=ingest_result.saved_images_local[0],
+                model="gen3a_turbo",
+                ratio="1280:768",
+                duration_seconds=5,
+            )
+            runway_result = await runway_generate(runway_payload)
+        except Exception as e:
+            runway_result = {"status": "FAILED", "detail": str(e)}
+    download_url = None
+    if runway_result and runway_result.get("video_file_path"):
+        download_url = (
+        f"http://127.0.0.1:8000/outputs/file?path="
+        f"{runway_result['video_file_path']}"
+    )
+
+    return {
+        "ingest": ingest_result.model_dump(),
+        "concept": concept_result.model_dump(),
+        "runway": runway_result,
+    }
