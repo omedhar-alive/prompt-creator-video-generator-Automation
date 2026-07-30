@@ -5,14 +5,17 @@ const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 /**
  * Create a ChatKit session via your backend.
  * Backend route: POST /chatkit/session
- * Body: { user_id }
+ * Body: { user_id, brand_name }
  * Returns: { session_id, client_secret }
  */
-export async function createChatkitSession(userId) {
+export async function createChatkitSession({ userId, brandName }) {
   const res = await fetch(`${API_BASE}/chatkit/session`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user_id: userId }),
+    body: JSON.stringify({
+      user_id: userId || "default",
+      brand_name: brandName,
+    }),
   });
 
   if (!res.ok) {

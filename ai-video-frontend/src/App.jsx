@@ -22,7 +22,10 @@ export default function App() {
   const startChatkit = async () => {
     setChatLoading(true);
     try {
-      const data = await createChatkitSession("omar-test");
+      const data = await createChatkitSession({
+        userId: "omar-test",
+        brandName: brandName, // take from your form input
+      });
       setSession(data);
     } catch (e) {
       console.error(e);
