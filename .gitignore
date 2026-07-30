@@ -17,3 +17,5 @@ google_credentials.json
 
 # Mac junk
 .DS_Store
+
+runway_smoke_test
